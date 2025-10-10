@@ -44,6 +44,78 @@ FORMAT_EXT = {
 _slug_pattern = re.compile(r"[^\w\-\u4e00-\u9fff]+")
 
 
+class GlobalDedupIndex:
+    """维护跨查询的全局去重索引。"""
+
+    index_filename = "_global_index.jsonl"
+
+    def __init__(self, dest_root: pathlib.Path):
+        self.dest_root = dest_root
+        self.index_path = dest_root / self.index_filename
+        self._hashes: set[str] = set()
+        self._url_keys: set[str] = set()
+        self._lock = asyncio.Lock()
+        if self.index_path.exists():
+            with self.index_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sha = record.get("sha1")
+                    url_key = record.get("url_md5")
+                    if isinstance(sha, str):
+                        self._hashes.add(sha)
+                    if isinstance(url_key, str):
+                        self._url_keys.add(url_key)
+
+    @staticmethod
+    def make_url_key(url: str) -> str:
+        return hashlib.md5(url.encode("utf-8", errors="ignore")).hexdigest()
+
+    async def claim_url(self, url_key: str) -> bool:
+        """尝试占用 URL，若已存在则返回 False。"""
+        async with self._lock:
+            if url_key in self._url_keys:
+                return False
+            self._url_keys.add(url_key)
+            return True
+
+    async def reserve_hash(self, sha1: str) -> bool:
+        """在写盘前占位，避免并发重复写。返回 False 表示重复。"""
+        async with self._lock:
+            if sha1 in self._hashes:
+                return False
+            self._hashes.add(sha1)
+            return True
+
+    async def rollback_hash(self, sha1: str) -> None:
+        async with self._lock:
+            self._hashes.discard(sha1)
+
+    async def record(
+        self,
+        sha1: str,
+        url_key: Optional[str],
+        url: str,
+        relative_path: str,
+    ) -> None:
+        """记录新的图片条目。"""
+        async with self._lock:
+            if url_key:
+                self._url_keys.add(url_key)
+            entry = {
+                "sha1": sha1,
+                "url_md5": url_key,
+                "url": url,
+                "path": relative_path,
+                "timestamp": time.time(),
+            }
+            with self.index_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
 def build_queries(default: bool) -> list[str]:
     base = [
         "室内 场景 日常 杂物",
@@ -64,6 +136,13 @@ def sanitize(text: str) -> str:
     if not s:
         s = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
     return s
+
+
+def _relative_to_root(path: pathlib.Path, root: pathlib.Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
 
 
 async def backoff_sleep(base=0.8, factor=2.0, attempt=0, jitter=0.2) -> None:
@@ -212,22 +291,22 @@ def should_keep_and_normalize(blob: bytes, debug: bool = False) -> Tuple[bool, b
             img = ImageOps.exif_transpose(img)
             width, height = img.size
 
-            # debug 下放宽阈值
-            min_dim = 300 if debug else MIN_DIMENSION
-            min_aspect = 0.3 if debug else MIN_ASPECT
-            max_aspect = 3.0 if debug else MAX_ASPECT
-
-            if not (min_dim <= width <= MAX_DIMENSION):
-                if debug: print(f"[debug] width {width} out of range")
-                return (False, b"", "", {})
-            if not (min_dim <= height <= MAX_DIMENSION):
-                if debug: print(f"[debug] height {height} out of range")
-                return (False, b"", "", {})
-
-            aspect = width / height if height else 0
-            if not (min_aspect <= aspect <= max_aspect):
-                if debug: print(f"[debug] aspect {aspect:.3f} out of range")
-                return (False, b"", "", {})
+            # # debug 下放宽阈值（暂时禁用尺寸/宽高过滤）
+            # min_dim = 300 if debug else MIN_DIMENSION
+            # min_aspect = 0.3 if debug else MIN_ASPECT
+            # max_aspect = 3.0 if debug else MAX_ASPECT
+            #
+            # if not (min_dim <= width <= MAX_DIMENSION):
+            #     if debug: print(f"[debug] width {width} out of range")
+            #     return (False, b"", "", {})
+            # if not (min_dim <= height <= MAX_DIMENSION):
+            #     if debug: print(f"[debug] height {height} out of range")
+            #     return (False, b"", "", {})
+            #
+            # aspect = width / height if height else 0
+            # if not (min_aspect <= aspect <= max_aspect):
+            #     if debug: print(f"[debug] aspect {aspect:.3f} out of range")
+            #     return (False, b"", "", {})
 
             fmt = (img.format or "JPEG").upper()
             suffix = FORMAT_EXT.get(fmt, ".jpg")
@@ -262,6 +341,8 @@ async def download_image(
     retries: int = 3,
     debug: bool = False,
     referer: Optional[str] = None,
+    dedup: Optional[GlobalDedupIndex] = None,
+    url_key: Optional[str] = None,
 ) -> bool:
     ref = "https://image.baidu.com/search/index?tn=baiduimage"
     last_err: Optional[Exception] = None
@@ -297,23 +378,39 @@ async def download_image(
             return False
 
         sha1 = hashlib.sha1(normalized).hexdigest()
+        reserved = True
+        if dedup:
+            reserved = await dedup.reserve_hash(sha1)
+            if not reserved:
+                return False
         out_path = dest / f"{sha1}{suffix}"
-        if out_path.exists():
-            return True
+        try:
+            if out_path.exists():
+                if dedup:
+                    rel = _relative_to_root(out_path, dedup.dest_root)
+                    await dedup.record(sha1, url_key, url, rel)
+                return False
 
-        out_path.write_bytes(normalized)
-        meta_payload = {
-            "source": str(url),
-            "sha1": sha1,
-            "content_type": resp.headers.get("Content-Type"),
-            "status": resp.status,
-            "final_url": str(resp.url),
-            **meta_img,
-        }
-        (dest / f"{sha1}.json").write_text(
-            json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return True
+            out_path.write_bytes(normalized)
+            meta_payload = {
+                "source": str(url),
+                "sha1": sha1,
+                "content_type": resp.headers.get("Content-Type"),
+                "status": resp.status,
+                "final_url": str(resp.url),
+                **meta_img,
+            }
+            (dest / f"{sha1}.json").write_text(
+                json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if dedup:
+                rel = _relative_to_root(out_path, dedup.dest_root)
+                await dedup.record(sha1, url_key, url, rel)
+            return True
+        except Exception:
+            if dedup and reserved:
+                await dedup.rollback_hash(sha1)
+            raise
 
     if debug and last_err:
         print(f"[debug] unreachable url={url} err={last_err}")
@@ -327,6 +424,7 @@ async def crawl_query(
     per_host: int = 8,
     batch_size: int = 20,
     debug: bool = False,
+    dedup: Optional[GlobalDedupIndex] = None,
 ) -> None:
     slug = sanitize(query)
     out_dir = dest_root / slug
@@ -344,7 +442,6 @@ async def crawl_query(
     async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
         tasks: list[asyncio.Task] = []
         seen_urls: set[str] = set()
-        seen_hashes: set[str] = set()
         downloaded = 0
         offset = 0
 
@@ -376,24 +473,36 @@ async def crawl_query(
                     print(f"[debug] no entries at offset={offset-30}")
                 break
 
-            batch_urls = []
+            batch_urls: list[tuple[str, str]] = []
             for entry in entries:
                 url = extract_url(entry)
                 if not url:
                     continue
-                dedup_key = hashlib.md5(url.encode("utf-8", errors="ignore")).hexdigest()
-                if dedup_key in seen_urls:
+                url_key = GlobalDedupIndex.make_url_key(url)
+                if url_key in seen_urls:
                     continue
-                seen_urls.add(dedup_key)
-                batch_urls.append(url)
+                seen_urls.add(url_key)
+                if dedup:
+                    claimed = await dedup.claim_url(url_key)
+                    if not claimed:
+                        continue
+                batch_urls.append((url, url_key))
 
             if debug:
                 print(f"[debug] offset={offset-30}, candidates={len(batch_urls)}")
 
-            for url in batch_urls:
+            for url, url_key in batch_urls:
                 tasks.append(
                     asyncio.create_task(
-                        download_image(session, url, out_dir, debug=debug, referer=referer_url)
+                        download_image(
+                            session,
+                            url,
+                            out_dir,
+                            debug=debug,
+                            referer=referer_url,
+                            dedup=dedup,
+                            url_key=url_key,
+                        )
                     )
                 )
                 if len(tasks) >= batch_size:
@@ -437,16 +546,25 @@ async def run_all(
     per_host: int,
     batch_size: int,
     debug: bool,
+    dedup: Optional[GlobalDedupIndex] = None,
 ) -> None:
     await asyncio.gather(
-        *(crawl_query(q, limit, dest_root, per_host=per_host, batch_size=batch_size, debug=debug)
+        *(crawl_query(
+            q,
+            limit,
+            dest_root,
+            per_host=per_host,
+            batch_size=batch_size,
+            debug=debug,
+            dedup=dedup,
+        )
           for q in queries)
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Baidu 室内场景抓取脚本（强化版）")
-    parser.add_argument("--output", default="crawledimg/raw", help="图片输出目录")
+    parser.add_argument("-o", "--output", default="crawledimg/baidu/raw", help="图片输出目录")
     parser.add_argument("-n", "--limit-per-query", type=int, default=200, help="每个查询抓取的上限数量")
     parser.add_argument("--query", action="append", default=[], help="自定义查询词，可多次提供")
     parser.add_argument("--query-file", help="包含查询词的文件，每行一个，支持注释")
@@ -463,6 +581,7 @@ def main() -> None:
 
     dest_root = pathlib.Path(args.output)
     dest_root.mkdir(parents=True, exist_ok=True)
+    dedup_index = GlobalDedupIndex(dest_root)
 
     asyncio.run(
         run_all(
@@ -472,6 +591,7 @@ def main() -> None:
             per_host=args.per_host,
             batch_size=args.batch_size,
             debug=args.debug,
+            dedup=dedup_index,
         )
     )
 

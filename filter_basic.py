@@ -3,7 +3,10 @@
 
 import argparse
 import csv
+import hashlib
+import json
 import pathlib
+import time
 from typing import Iterable, Optional
 
 import clip
@@ -20,6 +23,68 @@ PROMPTS = {
     "messy": "a very messy cluttered interior with many objects scattered everywhere",
     "moderate": "a realistic indoor scene with a manageable amount of objects and some clutter",
 }
+
+
+class FilterDedupIndex:
+    """维护筛选结果的全局去重索引。"""
+
+    index_filename = "_filtered_index.jsonl"
+
+    def __init__(self, root: pathlib.Path):
+        self.root = root
+        self.index_path = root / self.index_filename
+        self._hashes: set[str] = set()
+        if self.index_path.exists():
+            with self.index_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sha1 = record.get("sha1")
+                    if isinstance(sha1, str):
+                        self._hashes.add(sha1)
+
+    def seen(self, sha1: str) -> bool:
+        return sha1 in self._hashes
+
+    def add(self, sha1: str, source: pathlib.Path, target: pathlib.Path) -> None:
+        self._hashes.add(sha1)
+        try:
+            rel_target = target.relative_to(self.root)
+        except ValueError:
+            rel_target = target
+        entry = {
+            "sha1": sha1,
+            "source": str(source),
+            "target": str(rel_target),
+            "timestamp": time.time(),
+        }
+        with self.index_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def compute_sha1(path: pathlib.Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_meta_sha1(image_path: pathlib.Path) -> Optional[str]:
+    meta_path = image_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    sha1 = meta.get("sha1")
+    return sha1 if isinstance(sha1, str) else None
 
 
 def load_model(device: str):
@@ -99,6 +164,7 @@ def filter_images(
     model, preprocess, text_embed = load_model(device)
     keys = list(PROMPTS.keys())
     output_dir.mkdir(parents=True, exist_ok=True)
+    dedup = FilterDedupIndex(output_dir)
     log_path = output_dir / "clip_filter_log.csv"
 
     need_object_filter = object_count_min is not None or object_count_max is not None
@@ -127,8 +193,15 @@ def filter_images(
                     continue
                 if object_count_max is not None and object_count > object_count_max:
                     continue
+            sha1 = read_meta_sha1(image_path)
+            if not sha1:
+                sha1 = compute_sha1(image_path)
+            if dedup.seen(sha1):
+                continue
             target = output_dir / image_path.name
-            target.write_bytes(image_path.read_bytes())
+            data = image_path.read_bytes()
+            target.write_bytes(data)
+            dedup.add(sha1, image_path, target)
             row = [str(image_path), *(scores[key] for key in keys)]
             if need_object_filter:
                 row.append(object_count)
