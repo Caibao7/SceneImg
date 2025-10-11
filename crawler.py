@@ -417,6 +417,28 @@ async def download_image(
     return False
 
 
+def create_output_dir(
+    dest_root: pathlib.Path,
+    slug: str,
+    use_timestamp_subdir: bool,
+) -> pathlib.Path:
+    """Create the per-query output directory, optionally nested by timestamp."""
+    base_dir = dest_root / slug
+    if not use_timestamp_subdir:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    out_dir = base_dir / timestamp
+    counter = 1
+    while out_dir.exists():
+        out_dir = base_dir / f"{timestamp}-{counter:02d}"
+        counter += 1
+    out_dir.mkdir(parents=True, exist_ok=False)
+    return out_dir
+
+
 async def crawl_query(
     query: str,
     limit: int,
@@ -425,10 +447,10 @@ async def crawl_query(
     batch_size: int = 20,
     debug: bool = False,
     dedup: Optional[GlobalDedupIndex] = None,
+    use_timestamp_subdir: bool = False,
 ) -> None:
     slug = sanitize(query)
-    out_dir = dest_root / slug
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = create_output_dir(dest_root, slug, use_timestamp_subdir)
 
     connector = aiohttp.TCPConnector(limit_per_host=per_host, ssl=False)
     headers = {
@@ -522,7 +544,8 @@ async def crawl_query(
             if debug:
                 print(f"[debug] tail saved={got}, total={downloaded}")
 
-    print(f"{query} -> {downloaded} images")
+    rel_dir = _relative_to_root(out_dir, dest_root)
+    print(f"{query} -> {downloaded} images (saved to {rel_dir})")
 
 
 def parse_queries(query_arg: Iterable[str], default: bool) -> list[str]:
@@ -547,6 +570,7 @@ async def run_all(
     batch_size: int,
     debug: bool,
     dedup: Optional[GlobalDedupIndex] = None,
+    use_timestamp_subdir: bool = False,
 ) -> None:
     await asyncio.gather(
         *(crawl_query(
@@ -557,6 +581,7 @@ async def run_all(
             batch_size=batch_size,
             debug=debug,
             dedup=dedup,
+            use_timestamp_subdir=use_timestamp_subdir,
         )
           for q in queries)
     )
@@ -566,12 +591,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Baidu 室内场景抓取脚本（强化版）")
     parser.add_argument("-o", "--output", default="crawledimg/baidu/raw", help="图片输出目录")
     parser.add_argument("-n", "--limit-per-query", type=int, default=200, help="每个查询抓取的上限数量")
-    parser.add_argument("--query", action="append", default=[], help="自定义查询词，可多次提供")
+    parser.add_argument("-q", "--query", action="append", default=[], help="自定义查询词，可多次提供")
     parser.add_argument("--query-file", help="包含查询词的文件，每行一个，支持注释")
     parser.add_argument("--default-queries", action="store_true", help="使用内置的室内场景查询词")
     parser.add_argument("--debug", action="store_true", help="打印调试信息并放宽过滤阈值")
     parser.add_argument("--per-host", type=int, default=8, help="每主机并发上限（TCPConnector.limit_per_host）")
     parser.add_argument("--batch-size", type=int, default=20, help="攒多少下载任务再 gather 一次")
+    parser.add_argument(
+        "-t", 
+        "--timestamp-subdir",
+        action="store_true",
+        help="为每次运行在查询目录下创建新的时间戳子目录",
+    )
     args = parser.parse_args()
 
     queries = list(args.query)
@@ -592,6 +623,7 @@ def main() -> None:
             batch_size=args.batch_size,
             debug=args.debug,
             dedup=dedup_index,
+            use_timestamp_subdir=args.timestamp_subdir,
         )
     )
 
