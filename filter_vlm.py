@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover - 可选依赖
 # 配置
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = os.environ.get("OPENAI_VLM_MODEL", "gpt-4.1")
+DEFAULT_MODEL = os.environ.get("OPENAI_VLM_MODEL", "qwen3-vl:235b-cloud")
 DEFAULT_OLLAMA_LOCAL_URL = os.environ.get("OLLAMA_LOCAL_URL", "http://localhost:11434")
 DEFAULT_OLLAMA_CLOUD_URL = os.environ.get("OLLAMA_CLOUD_URL", "https://ollama.com")
 OLLAMA_API_KEY_ENV = "OLLAMA_API_KEY"
